@@ -47,13 +47,13 @@ logger = logging.getLogger(__name__)
 MODEL_PATH = os.getenv("MODEL_PATH", "yolov8n-pose.pt")
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "")
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "")
-VOICE_CHECK_WAIT = int(os.getenv("VOICE_CHECK_WAIT", "20"))  # seconds to wait after "Are you okay?"
+VOICE_CHECK_WAIT = int(os.getenv("VOICE_CHECK_WAIT", "20"))
 
 UPLOAD_DIR = Path(tempfile.mkdtemp(prefix="equifall_"))
 video_store: dict = {}
 incident_store: list = []
 notification_store: list = []
-alert_cancelled = False 
+alert_cancelled = False
 
 # Emergency contacts
 EMERGENCY_CONTACTS = [
@@ -66,12 +66,18 @@ EMERGENCY_CONTACTS = [
 ]
 
 # ============ YOLO MODEL ============
-try:
-    model = YOLO(MODEL_PATH)
-    logger.info(f"✅ Model loaded: {MODEL_PATH}")
-except Exception as e:
-    logger.error(f"❌ Model load failed: {e}")
-    model = None
+model = None
+
+def get_model():
+    global model
+    if model is None:
+        try:
+            model = YOLO(MODEL_PATH)
+            logger.info(f"✅ Model loaded: {MODEL_PATH}")
+        except Exception as e:
+            logger.error(f"❌ Model load failed: {e}")
+            model = None
+    return model
 
 # ============ VOICE ENGINE ============
 _tts_lock = threading.Lock()
@@ -95,224 +101,7 @@ def speak(text: str):
                 logger.error(f"❌ TTS error: {e}")
     threading.Thread(target=_speak, daemon=True).start()
 
-
-async def _staged_alert_flow(falls_count: int, location: str):
-    """
-    Stage 1: Voice asks 'Are you okay?'
-    Stage 2: Wait 20 seconds for a response
-    Stage 3: If not cancelled → announce fall, send Telegram, call contacts
-    """
-    global alert_cancelled
-    alert_cancelled = False
-
-    # --- Stage 1: Ask if person is okay ---
-    try:
-        import pyttsx3
-        engine = pyttsx3.init()
-        engine.setProperty('rate', 140)
-        engine.setProperty('volume', 1.0)
-        engine.say("Attention. A possible fall has been detected. Are you okay? Please respond verbally.")
-        engine.runAndWait()
-        engine.stop()
-        logger.info("🔊 Voice check: Asked 'Are you okay?'")
-    except Exception as e:
-        logger.warning(f"Voice check failed: {e}")
-
-    # --- Stage 2: Wait 20 seconds ---
-    logger.info("⏳ Waiting 20 seconds for patient response...")
-    for i in range(20):
-        await asyncio.sleep(1)
-        if alert_cancelled:
-            logger.info("✅ Alert cancelled during wait period — false alarm confirmed")
-            return {
-                "status": "cancelled",
-                "total_alerts": 0,
-                "contacted": [],
-                "fall_events": falls_count,
-                "voice_check": True,
-                "wait_seconds": i + 1,
-                "stages": ["voice_check", "waiting", "cancelled"]
-            }
-
-    # --- Stage 3: No response — escalate ---
-    logger.info("🚨 No response after 20s — escalating!")
-
-    # Voice announcement
-    try:
-        import pyttsx3
-        engine = pyttsx3.init()
-        engine.setProperty('rate', 150)
-        engine.setProperty('volume', 1.0)
-        engine.say(f"Alert! Fall detected at {location}. No response from patient. Contacting emergency services now.")
-        engine.runAndWait()
-        engine.stop()
-        logger.info("🔊 Voice escalation: Announced fall and contacting emergency")
-    except Exception as e:
-        logger.warning(f"Voice escalation failed: {e}")
-
-    if alert_cancelled:
-        return {
-            "status": "cancelled",
-            "total_alerts": 0,
-            "contacted": [],
-            "fall_events": falls_count,
-            "voice_check": True,
-            "wait_seconds": 20,
-            "stages": ["voice_check", "waiting", "cancelled"]
-        }
-
-    # Send Telegram
-    contacted = []
-    try:
-        telegram_ok = await send_telegram_alert(falls_count, location)
-        if telegram_ok:
-            contacted.append("Telegram")
-    except Exception as e:
-        logger.warning(f"Telegram alert failed: {e}")
-
-    # Send SMS/Email (your existing notification logic)
-    try:
-        await send_notifications(falls_count, location)
-        contacted.extend(["SMS", "Email"])
-    except Exception as e:
-        logger.warning(f"Notification sending failed: {e}")
-
-    return {
-        "status": "alerts_sent",
-        "total_alerts": len(contacted),
-        "contacted": contacted,
-        "fall_events": falls_count,
-        "voice_check": True,
-        "wait_seconds": 20,
-        "stages": ["voice_check", "waiting", "no_response", "emergency_call", "alerts_sent"]
-    }
-
-# ============ FALL DETECTION ============
-def is_fall(keypoints, confidence_threshold=0.5):
-    """Detect falls using pose keypoints — improved logic"""
-    if keypoints is None or len(keypoints) == 0:
-        return False
-
-    try:
-        kp = keypoints[0] if len(keypoints.shape) > 2 else keypoints
-        if len(kp) < 17:
-            return False
-
-        # Get key body points
-        nose = kp[0]
-        left_hip, right_hip = kp[11], kp[12]
-        left_ankle, right_ankle = kp[15], kp[16]
-        left_shoulder, right_shoulder = kp[5], kp[6]
-
-        # Check confidence
-        key_points = [nose, left_hip, right_hip, left_ankle, right_ankle]
-        if any(p[2] < confidence_threshold for p in key_points if len(p) > 2):
-            return False
-
-        # Calculate body metrics
-        hip_y = (left_hip[1] + right_hip[1]) / 2
-        shoulder_y = (left_shoulder[1] + right_shoulder[1]) / 2
-        ankle_y = (left_ankle[1] + right_ankle[1]) / 2
-        nose_y = nose[1]
-
-        # Torso height
-        torso_height = abs(shoulder_y - hip_y)
-        if torso_height < 10:
-            return False
-
-        # Fall conditions:
-        # 1. Hip is close to or below ankles (person is on ground)
-        hip_ankle_diff = ankle_y - hip_y
-        # 2. Torso is more horizontal than vertical
-        shoulder_hip_ratio = abs(shoulder_y - hip_y) / max(abs(left_shoulder[0] - right_shoulder[0]), 1)
-        # 3. Nose is at or below hip level
-        nose_below_threshold = nose_y > hip_y - torso_height * 0.3
-
-        is_on_ground = hip_ankle_diff < torso_height * 0.5
-        is_horizontal = shoulder_hip_ratio < 1.2
-        nose_low = nose_below_threshold
-
-        return (is_on_ground and is_horizontal) or (is_on_ground and nose_low) or (is_horizontal and nose_low)
-
-    except (IndexError, TypeError):
-        return False
-
-def analyze_video_file(video_path: str, facility_id: str = "Facility A"):
-    """Analyze video for falls"""
-    cap = cv2.VideoCapture(video_path)
-    if not cap.isOpened():
-        raise HTTPException(status_code=400, detail="Cannot open video file")
-
-    total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
-    fps = cap.get(cv2.CAP_PROP_FPS) or 30.0
-    falls = []
-    fall_frames = []
-    current_fall_start = None
-    consecutive_fall = 0
-    MIN_CONSECUTIVE = 2
-
-    logger.info(f"🔍 Analyzing video: {total_frames} frames, {fps} FPS")
-
-    frame_idx = 0
-    while True:
-        ret, frame = cap.read()
-        if not ret:
-            break
-
-        if frame_idx % max(1, total_frames // 5) == 0:
-            pct = (frame_idx / total_frames) * 100
-            logger.info(f"⏳ Progress: {pct:.1f}%")
-
-        if model:
-            results = model(frame, verbose=False)
-            for r in results:
-                if r.keypoints is not None and len(r.keypoints) > 0:
-                    if is_fall(r.keypoints.data.cpu().numpy()):
-                        consecutive_fall += 1
-                        if consecutive_fall >= MIN_CONSECUTIVE:
-                            if current_fall_start is None:
-                                current_fall_start = frame_idx
-                                logger.warning(f"🚨 FALL DETECTED at frame {frame_idx}")
-                            fall_frames.append(frame_idx)
-                    else:
-                        if current_fall_start is not None and consecutive_fall >= MIN_CONSECUTIVE:
-                            falls.append({
-                                "start_frame": current_fall_start,
-                                "end_frame": frame_idx,
-                            })
-                        current_fall_start = None
-                        consecutive_fall = 0
-
-        frame_idx += 1
-
-    # Close any open fall event
-    if current_fall_start is not None:
-        falls.append({
-            "start_frame": current_fall_start,
-            "end_frame": frame_idx - 1,
-        })
-
-    cap.release()
-
-    # Build fall events
-    fall_events = []
-    for i, fall in enumerate(falls):
-        start_sec = fall["start_frame"] / fps
-        end_sec = fall["end_frame"] / fps
-        duration = end_sec - start_sec
-        fall_events.append({
-            "event_id": i + 1,
-            "start_frame": fall["start_frame"],
-            "end_frame": fall["end_frame"],
-            "start_time": f"{int(start_sec // 60):02d}:{start_sec % 60:05.2f}",
-            "end_time": f"{int(end_sec // 60):02d}:{end_sec % 60:05.2f}",
-            "duration": round(duration, 2),
-        })
-
-    logger.info(f"✓ Analysis complete. Found {len(fall_events)} fall event(s)")
-    return fall_events, total_frames, fps
-
-# ============ ALERT SYSTEM ============
+# ============ TELEGRAM ============
 def send_telegram(message: str) -> bool:
     if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
         logger.warning("⚠️ Telegram not configured")
@@ -334,8 +123,9 @@ def send_telegram(message: str) -> bool:
         logger.error(f"❌ Telegram send failed: {e}")
         return False
 
+# ============ ALERT SYSTEM ============
 def send_all_alerts(location: str, falls_count: int) -> list:
-    """Send alerts to all emergency contacts"""
+    """Send alerts to all emergency contacts + Telegram"""
     contacted = []
     now = datetime.now().isoformat()
 
@@ -355,7 +145,7 @@ def send_all_alerts(location: str, falls_count: int) -> list:
             contacted.append(contact["phone"])
         elif contact["type"] == "EMAIL":
             notif["subject"] = f"⚠️ EquiFall+ Alert: {falls_count} Fall(s) — {location}"
-            notif["message"] = f"Fall detected. Voice check received no response after {VOICE_CHECK_WAIT}s. Emergency contacts are being notified. Please respond immediately."
+            notif["message"] = f"Fall detected. Voice check received no response after {VOICE_CHECK_WAIT}s. Emergency contacts are being notified."
             contacted.append(contact["email"])
 
         notification_store.append(notif)
@@ -388,6 +178,154 @@ def send_all_alerts(location: str, falls_count: int) -> list:
     logger.warning(f"✓ Alerts sent to {len(contacted)} contact(s)")
     return contacted
 
+def staged_voice_alert(location: str, falls_count: int) -> list:
+    """
+    Synchronous staged alert (runs in background thread):
+    Stage 1: Voice asks 'Are you okay?'
+    Stage 2: Wait 20 seconds
+    Stage 3: If not cancelled → announce fall, send Telegram + all alerts
+    """
+    global alert_cancelled
+    alert_cancelled = False
+
+    # --- Stage 1: Ask if person is okay ---
+    speak("Attention. A possible fall has been detected. Are you okay? Please respond verbally.")
+    logger.info("🔊 Voice check: Asked 'Are you okay?'")
+
+    # --- Stage 2: Wait for response ---
+    logger.info(f"⏳ Waiting {VOICE_CHECK_WAIT} seconds for patient response...")
+    for i in range(VOICE_CHECK_WAIT):
+        time.sleep(1)
+        if alert_cancelled:
+            logger.info("✅ Alert cancelled during wait — false alarm confirmed")
+            return []
+
+    # --- Stage 3: No response — escalate ---
+    if alert_cancelled:
+        logger.info("✅ Alert cancelled — false alarm confirmed")
+        return []
+
+    logger.info("🚨 No response after wait — escalating!")
+    speak(f"Alert! Fall detected at {location}. No response from patient. Contacting emergency services now.")
+
+    # Send all alerts (SMS, Email, Telegram)
+    contacted = send_all_alerts(location, falls_count)
+    return contacted
+
+# ============ FALL DETECTION ============
+def is_fall(keypoints, confidence_threshold=0.5):
+    """Detect falls using pose keypoints"""
+    if keypoints is None or len(keypoints) == 0:
+        return False
+
+    try:
+        kp = keypoints[0] if len(keypoints.shape) > 2 else keypoints
+        if len(kp) < 17:
+            return False
+
+        nose = kp[0]
+        left_hip, right_hip = kp[11], kp[12]
+        left_ankle, right_ankle = kp[15], kp[16]
+        left_shoulder, right_shoulder = kp[5], kp[6]
+
+        key_points = [nose, left_hip, right_hip, left_ankle, right_ankle]
+        if any(p[2] < confidence_threshold for p in key_points if len(p) > 2):
+            return False
+
+        hip_y = (left_hip[1] + right_hip[1]) / 2
+        shoulder_y = (left_shoulder[1] + right_shoulder[1]) / 2
+        ankle_y = (left_ankle[1] + right_ankle[1]) / 2
+        nose_y = nose[1]
+
+        torso_height = abs(shoulder_y - hip_y)
+        if torso_height < 10:
+            return False
+
+        hip_ankle_diff = ankle_y - hip_y
+        shoulder_hip_ratio = abs(shoulder_y - hip_y) / max(abs(left_shoulder[0] - right_shoulder[0]), 1)
+        nose_below_threshold = nose_y > hip_y - torso_height * 0.3
+
+        is_on_ground = hip_ankle_diff < torso_height * 0.5
+        is_horizontal = shoulder_hip_ratio < 1.2
+        nose_low = nose_below_threshold
+
+        return (is_on_ground and is_horizontal) or (is_on_ground and nose_low) or (is_horizontal and nose_low)
+
+    except (IndexError, TypeError):
+        return False
+
+def analyze_video_file(video_path: str, facility_id: str = "Facility A"):
+    """Analyze video for falls"""
+    cap = cv2.VideoCapture(video_path)
+    if not cap.isOpened():
+        raise HTTPException(status_code=400, detail="Cannot open video file")
+
+    total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+    fps = cap.get(cv2.CAP_PROP_FPS) or 30.0
+    falls = []
+    current_fall_start = None
+    consecutive_fall = 0
+    MIN_CONSECUTIVE = 2
+
+    logger.info(f"🔍 Analyzing video: {total_frames} frames, {fps} FPS")
+
+    frame_idx = 0
+    while True:
+        ret, frame = cap.read()
+        if not ret:
+            break
+
+        if frame_idx % max(1, total_frames // 5) == 0:
+            pct = (frame_idx / total_frames) * 100
+            logger.info(f"⏳ Progress: {pct:.1f}%")
+
+        m = get_model()
+        if m:
+            results = m(frame, verbose=False)
+            for r in results:
+                if r.keypoints is not None and len(r.keypoints) > 0:
+                    if is_fall(r.keypoints.data.cpu().numpy()):
+                        consecutive_fall += 1
+                        if consecutive_fall >= MIN_CONSECUTIVE:
+                            if current_fall_start is None:
+                                current_fall_start = frame_idx
+                                logger.warning(f"🚨 FALL DETECTED at frame {frame_idx}")
+                    else:
+                        if current_fall_start is not None and consecutive_fall >= MIN_CONSECUTIVE:
+                            falls.append({
+                                "start_frame": current_fall_start,
+                                "end_frame": frame_idx,
+                            })
+                        current_fall_start = None
+                        consecutive_fall = 0
+
+        frame_idx += 1
+
+    if current_fall_start is not None:
+        falls.append({
+            "start_frame": current_fall_start,
+            "end_frame": frame_idx - 1,
+        })
+
+    cap.release()
+
+    fall_events = []
+    for i, fall in enumerate(falls):
+        start_sec = fall["start_frame"] / fps
+        end_sec = fall["end_frame"] / fps
+        duration = end_sec - start_sec
+        fall_events.append({
+            "event_id": i + 1,
+            "start_frame": fall["start_frame"],
+            "end_frame": fall["end_frame"],
+            "start_time": f"{int(start_sec // 60):02d}:{start_sec % 60:05.2f}",
+            "end_time": f"{int(end_sec // 60):02d}:{end_sec % 60:05.2f}",
+            "duration": round(duration, 2),
+        })
+
+    logger.info(f"✓ Analysis complete. Found {len(fall_events)} fall event(s)")
+    return fall_events, total_frames, fps
+
 def create_annotated_video(video_path: str, output_path: str, fall_events: list, fps: float):
     """Create annotated video with skeleton overlay and fall markers"""
     cap = cv2.VideoCapture(video_path)
@@ -407,13 +345,13 @@ def create_annotated_video(video_path: str, output_path: str, fall_events: list,
         if not ret:
             break
 
-        if model:
-            results = model(frame, verbose=False)
+        m = get_model()
+        if m:
+            results = m(frame, verbose=False)
             for r in results:
                 if r.keypoints is not None:
                     kps = r.keypoints.data.cpu().numpy()
                     for person_kps in kps:
-                        # Draw skeleton
                         skeleton_pairs = [
                             (5, 6), (5, 7), (7, 9), (6, 8), (8, 10),
                             (5, 11), (6, 12), (11, 12), (11, 13), (13, 15),
@@ -433,21 +371,19 @@ def create_annotated_video(video_path: str, output_path: str, fall_events: list,
                                 color = (0, 0, 255) if frame_idx in fall_frame_set else (0, 255, 0)
                                 cv2.circle(frame, (int(x), int(y)), 4, color, -1)
 
-                # Bounding boxes
                 if r.boxes is not None:
                     for box in r.boxes:
                         x1, y1, x2, y2 = box.xyxy[0].cpu().numpy()
                         color = (0, 0, 255) if frame_idx in fall_frame_set else (0, 255, 0)
-                        label = "⚠ FALL" if frame_idx in fall_frame_set else "Person"
+                        label = "FALL" if frame_idx in fall_frame_set else "Person"
                         cv2.rectangle(frame, (int(x1), int(y1)), (int(x2), int(y2)), color, 2)
                         cv2.putText(frame, label, (int(x1), int(y1) - 10),
                                     cv2.FONT_HERSHEY_SIMPLEX, 0.7, color, 2)
 
-        # Fall warning overlay
         if frame_idx in fall_frame_set:
             overlay = frame.copy()
             cv2.rectangle(overlay, (0, 0), (w, 40), (0, 0, 200), -1)
-            cv2.putText(overlay, "⚠ FALL DETECTED — VOICE CHECK IN PROGRESS",
+            cv2.putText(overlay, "FALL DETECTED",
                         (10, 28), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 255), 2)
             frame = cv2.addWeighted(overlay, 0.7, frame, 0.3, 0)
 
@@ -461,9 +397,10 @@ def create_annotated_video(video_path: str, output_path: str, fall_events: list,
 
 @app.get("/health")
 async def health():
+    m = get_model()
     return {
         "status": "healthy",
-        "model_loaded": model is not None,
+        "model_loaded": m is not None,
         "telegram_configured": bool(TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_ID),
         "tts_available": TTS_AVAILABLE,
         "voice_check_wait": VOICE_CHECK_WAIT,
@@ -471,60 +408,46 @@ async def health():
     }
 
 @app.post("/api/cctv/analyze-video")
-async def analyze_video(
+async def analyze_video_endpoint(
     background_tasks: BackgroundTasks,
     file: UploadFile = File(...),
     facility_id: str = "Facility A",
 ):
-    if not model:
+    m = get_model()
+    if not m:
         raise HTTPException(status_code=503, detail="Model not loaded")
 
-    # Save uploaded file
     video_path = UPLOAD_DIR / file.filename
     with open(video_path, "wb") as f:
         shutil.copyfileobj(file.file, f)
 
     logger.info(f"📹 Video uploaded: {file.filename}")
 
-    # Analyze
     fall_events, total_frames, fps = analyze_video_file(str(video_path), facility_id)
 
-    # Create annotated video
     video_id = f"video_{len(video_store)}"
     annotated_path = UPLOAD_DIR / f"annotated_{file.filename}"
     create_annotated_video(str(video_path), str(annotated_path), fall_events, fps)
     video_store[video_id] = str(annotated_path)
 
-    # Handle falls with staged voice alert
     alert_result = None
     if fall_events:
         logger.warning(f"🚨 {len(fall_events)} FALL(S) DETECTED — INITIATING STAGED VOICE CHECK")
 
-        def staged_alert():
+        def run_staged_alert():
             contacted = staged_voice_alert(facility_id, len(fall_events))
-            nonlocal alert_result
-            alert_result_data = {
-                "status": "alerts_sent",
-                "total_alerts": len(contacted),
-                "contacted": contacted,
-                "fall_events": len(fall_events),
-                "voice_check": True,
-                "wait_seconds": VOICE_CHECK_WAIT,
-            }
-            # Store incident
             incident_store.append({
                 "video_filename": file.filename,
                 "location": facility_id,
                 "source": "upload",
                 "falls_count": len(fall_events),
-                "severity": "Critical" if len(fall_events) >= 3 else "Moderate" if len(fall_events) >= 1 else "Low",
+                "severity": "Critical" if len(fall_events) >= 3 else "Moderate",
                 "timestamp": datetime.now().isoformat(),
                 "falls": fall_events,
                 "alert_stages": ["voice_check", "wait_20s", "escalate", "emergency_call"],
             })
 
-        # Run staged alert in background so response returns immediately
-        background_tasks.add_task(staged_alert)
+        background_tasks.add_task(run_staged_alert)
 
         alert_result = {
             "status": "staged_alert_initiated",
@@ -534,11 +457,11 @@ async def analyze_video(
             "voice_check": True,
             "wait_seconds": VOICE_CHECK_WAIT,
             "stages": [
-                "🎤 Voice check: 'Are you okay?'",
-                f"⏳ Waiting {VOICE_CHECK_WAIT}s for response...",
-                "🚨 No response — escalating",
-                "📞 Emergency call to primary contact",
-                "📨 Alerts sent to all contacts",
+                "Voice check: 'Are you okay?'",
+                f"Waiting {VOICE_CHECK_WAIT}s for response...",
+                "No response — escalating",
+                "Emergency call to primary contact",
+                "Alerts sent to all contacts",
             ],
         }
 
@@ -602,16 +525,12 @@ async def test_telegram():
     ok = send_telegram(msg)
     return {"success": ok, "error": None if ok else "Failed to send"}
 
-
-
 @app.post("/api/alerts/cancel")
 async def cancel_alert():
-    """Cancel an ongoing alert escalation (false alarm)"""
     global alert_cancelled
     alert_cancelled = True
     logger.info("🛑 Alert cancellation requested from frontend")
     return {"success": True, "message": "Alert escalation cancelled"}
-
 
 # ============ STARTUP ============
 if __name__ == "__main__":
@@ -638,4 +557,3 @@ if __name__ == "__main__":
     print("=" * 70 + "\n")
 
     uvicorn.run(app, host="0.0.0.0", port=port)
-
