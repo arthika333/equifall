@@ -6,3 +6,4 @@ ultralytics
 python-dotenv
 sendgrid
 gunicorn
+requests
