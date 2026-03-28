@@ -1,6 +1,6 @@
 from fastapi import FastAPI, UploadFile, File, HTTPException, BackgroundTasks
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import JSONResponse, FileResponse, StreamingResponse
+from fastapi.responses import JSONResponse, StreamingResponse
 import cv2
 import numpy as np
 import logging
@@ -14,12 +14,12 @@ import tempfile
 import shutil
 from pathlib import Path
 import json
-import io
 import requests
 import threading
 import time
+import uuid
 
-# Text-to-speech (Windows: pyttsx3, fallback: print)
+# Text-to-speech (Windows: pyttsx3, fallback: print-only)
 try:
     import pyttsx3
     TTS_AVAILABLE = True
@@ -30,7 +30,7 @@ except ImportError:
 load_dotenv()
 
 # ============ CONFIG ============
-app = FastAPI(title="EquiFall+ API", version="2.0.0")
+app = FastAPI(title="EquiFall+ API", version="3.0.0")
 
 app.add_middleware(
     CORSMiddleware,
@@ -54,6 +54,9 @@ video_store: dict = {}
 incident_store: list = []
 notification_store: list = []
 alert_cancelled = False
+
+# Job store for async processing
+job_store: dict = {}  # job_id -> { status, progress, result, error }
 
 # Emergency contacts
 EMERGENCY_CONTACTS = [
@@ -104,7 +107,7 @@ def speak(text: str):
 # ============ TELEGRAM ============
 def send_telegram(message: str) -> bool:
     if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
-        logger.warning("⚠️ Telegram not configured")
+        logger.warning("⚠️ Telegram not configured (missing TELEGRAM_BOT_TOKEN or TELEGRAM_CHAT_ID)")
         return False
     try:
         url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
@@ -254,11 +257,11 @@ def is_fall(keypoints, confidence_threshold=0.5):
     except (IndexError, TypeError):
         return False
 
-def analyze_video_file(video_path: str, facility_id: str = "Facility A"):
-    """Analyze video for falls"""
+def analyze_video_file(video_path: str, facility_id: str = "Facility A", job_id: str = None):
+    """Analyze video for falls — updates job_store progress if job_id provided"""
     cap = cv2.VideoCapture(video_path)
     if not cap.isOpened():
-        raise HTTPException(status_code=400, detail="Cannot open video file")
+        raise Exception("Cannot open video file")
 
     total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
     fps = cap.get(cv2.CAP_PROP_FPS) or 30.0
@@ -274,6 +277,11 @@ def analyze_video_file(video_path: str, facility_id: str = "Facility A"):
         ret, frame = cap.read()
         if not ret:
             break
+
+        # Update progress in job store
+        if job_id and total_frames > 0:
+            pct = int((frame_idx / total_frames) * 85) + 10  # 10-95%
+            job_store[job_id]["progress"] = pct
 
         if frame_idx % max(1, total_frames // 5) == 0:
             pct = (frame_idx / total_frames) * 100
@@ -393,6 +401,86 @@ def create_annotated_video(video_path: str, output_path: str, fall_events: list,
     cap.release()
     out.release()
 
+# ============ BACKGROUND JOB PROCESSOR ============
+def process_video_job(job_id: str, video_path: str, filename: str, facility_id: str):
+    """Runs in a background thread — processes video and updates job_store"""
+    try:
+        job_store[job_id]["status"] = "processing"
+        job_store[job_id]["progress"] = 10
+
+        # Analyze
+        fall_events, total_frames, fps = analyze_video_file(str(video_path), facility_id, job_id)
+
+        job_store[job_id]["progress"] = 90
+
+        # Create annotated video
+        video_id = f"video_{len(video_store)}"
+        annotated_path = UPLOAD_DIR / f"annotated_{filename}"
+        create_annotated_video(str(video_path), str(annotated_path), fall_events, fps)
+        video_store[video_id] = str(annotated_path)
+
+        job_store[job_id]["progress"] = 95
+
+        # Handle falls with staged voice alert
+        alert_result = None
+        if fall_events:
+            logger.warning(f"🚨 {len(fall_events)} FALL(S) DETECTED — INITIATING STAGED VOICE CHECK")
+
+            def run_staged_alert():
+                contacted = staged_voice_alert(facility_id, len(fall_events))
+                incident_store.append({
+                    "video_filename": filename,
+                    "location": facility_id,
+                    "source": "upload",
+                    "falls_count": len(fall_events),
+                    "severity": "Critical" if len(fall_events) >= 3 else "Moderate",
+                    "timestamp": datetime.now().isoformat(),
+                    "falls": fall_events,
+                    "alert_stages": ["voice_check", "wait_20s", "escalate", "emergency_call"],
+                })
+
+            threading.Thread(target=run_staged_alert, daemon=True).start()
+
+            alert_result = {
+                "status": "staged_alert_initiated",
+                "total_alerts": len(EMERGENCY_CONTACTS) + 1,
+                "contacted": [c.get("phone", c.get("email", "")) for c in EMERGENCY_CONTACTS] + ["@equifall_bot"],
+                "fall_events": len(fall_events),
+                "voice_check": True,
+                "wait_seconds": VOICE_CHECK_WAIT,
+                "stages": [
+                    "Voice check: 'Are you okay?'",
+                    f"Waiting {VOICE_CHECK_WAIT}s for response...",
+                    "No response — escalating",
+                    "Emergency call to primary contact",
+                    "Alerts sent to all contacts",
+                ],
+            }
+
+        # Build final result
+        result = {
+            "video_filename": filename,
+            "video_id": video_id,
+            "stream_url": f"/api/video/stream/{video_id}",
+            "analysis": {
+                "total_falls": len(fall_events),
+                "falls_detected": fall_events,
+                "status": f"Analysis complete — {len(fall_events)} fall event(s) detected across {total_frames} frames",
+            },
+            "alert_result": alert_result,
+            "message": "Analysis complete",
+        }
+
+        job_store[job_id]["status"] = "complete"
+        job_store[job_id]["progress"] = 100
+        job_store[job_id]["result"] = result
+        logger.info(f"✅ Job {job_id} complete")
+
+    except Exception as e:
+        logger.error(f"❌ Job {job_id} failed: {e}")
+        job_store[job_id]["status"] = "error"
+        job_store[job_id]["error"] = str(e)
+
 # ============ API ENDPOINTS ============
 
 @app.get("/health")
@@ -404,15 +492,18 @@ async def health():
         "telegram_configured": bool(TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_ID),
         "tts_available": TTS_AVAILABLE,
         "voice_check_wait": VOICE_CHECK_WAIT,
-        "version": "2.0.0",
+        "version": "3.0.0",
     }
 
 @app.post("/api/cctv/analyze-video")
 async def analyze_video_endpoint(
-    background_tasks: BackgroundTasks,
     file: UploadFile = File(...),
     facility_id: str = "Facility A",
 ):
+    """
+    Accepts video upload, returns a job_id immediately.
+    The frontend polls /api/job/{job_id} for status and results.
+    """
     m = get_model()
     if not m:
         raise HTTPException(status_code=503, detail="Model not loaded")
@@ -423,59 +514,38 @@ async def analyze_video_endpoint(
 
     logger.info(f"📹 Video uploaded: {file.filename}")
 
-    fall_events, total_frames, fps = analyze_video_file(str(video_path), facility_id)
+    # Create a job and process in background thread
+    job_id = str(uuid.uuid4())[:8]
+    job_store[job_id] = {
+        "status": "processing",
+        "progress": 5,
+        "result": None,
+        "error": None,
+    }
 
-    video_id = f"video_{len(video_store)}"
-    annotated_path = UPLOAD_DIR / f"annotated_{file.filename}"
-    create_annotated_video(str(video_path), str(annotated_path), fall_events, fps)
-    video_store[video_id] = str(annotated_path)
+    # Run processing in a background thread (not blocked by request timeout)
+    thread = threading.Thread(
+        target=process_video_job,
+        args=(job_id, video_path, file.filename, facility_id),
+        daemon=True,
+    )
+    thread.start()
 
-    alert_result = None
-    if fall_events:
-        logger.warning(f"🚨 {len(fall_events)} FALL(S) DETECTED — INITIATING STAGED VOICE CHECK")
+    # Return immediately — frontend will poll /api/job/{job_id}
+    return {"job_id": job_id}
 
-        def run_staged_alert():
-            contacted = staged_voice_alert(facility_id, len(fall_events))
-            incident_store.append({
-                "video_filename": file.filename,
-                "location": facility_id,
-                "source": "upload",
-                "falls_count": len(fall_events),
-                "severity": "Critical" if len(fall_events) >= 3 else "Moderate",
-                "timestamp": datetime.now().isoformat(),
-                "falls": fall_events,
-                "alert_stages": ["voice_check", "wait_20s", "escalate", "emergency_call"],
-            })
+@app.get("/api/job/{job_id}")
+async def get_job_status(job_id: str):
+    """Poll this endpoint to check if analysis is done."""
+    if job_id not in job_store:
+        raise HTTPException(status_code=404, detail="Job not found")
 
-        background_tasks.add_task(run_staged_alert)
-
-        alert_result = {
-            "status": "staged_alert_initiated",
-            "total_alerts": len(EMERGENCY_CONTACTS) + 1,
-            "contacted": [c.get("phone", c.get("email", "")) for c in EMERGENCY_CONTACTS] + ["@equifall_bot"],
-            "fall_events": len(fall_events),
-            "voice_check": True,
-            "wait_seconds": VOICE_CHECK_WAIT,
-            "stages": [
-                "Voice check: 'Are you okay?'",
-                f"Waiting {VOICE_CHECK_WAIT}s for response...",
-                "No response — escalating",
-                "Emergency call to primary contact",
-                "Alerts sent to all contacts",
-            ],
-        }
-
+    job = job_store[job_id]
     return {
-        "video_filename": file.filename,
-        "video_id": video_id,
-        "stream_url": f"/api/video/stream/{video_id}",
-        "analysis": {
-            "total_falls": len(fall_events),
-            "falls_detected": fall_events,
-            "status": f"Analysis complete — {len(fall_events)} fall event(s) detected across {total_frames} frames",
-        },
-        "alert_result": alert_result,
-        "message": "Analysis complete",
+        "status": job["status"],
+        "progress": job.get("progress", 0),
+        "result": job.get("result"),
+        "error": job.get("error"),
     }
 
 @app.get("/api/video/stream/{video_id}")
@@ -536,7 +606,7 @@ async def cancel_alert():
 if __name__ == "__main__":
     port = int(os.getenv("PORT", 8000))
     print("\n" + "=" * 70)
-    print("🛡️  EquiFall+ v2.0 — Staged Voice Alert System")
+    print("🛡️  EquiFall+ v3.0 — Async Job Processing + Staged Voice Alert")
     print("=" * 70)
     print(f"\n🌐 Server: http://localhost:{port}")
     print(f"📚 API Docs: http://localhost:{port}/docs")
@@ -548,12 +618,11 @@ if __name__ == "__main__":
     else:
         print(f"📱 Telegram: ❌ Not configured")
 
-    print(f"\n🎯 STAGED ALERT FLOW:")
-    print(f"  1. Fall detected → Voice asks 'Are you okay?'")
-    print(f"  2. Wait {VOICE_CHECK_WAIT} seconds for response")
-    print(f"  3. No response → Announce emergency alert")
-    print(f"  4. Send SMS/Email/Telegram to all contacts")
-    print(f"  5. Emergency call to primary contact (demo)")
+    print(f"\n🎯 ASYNC JOB FLOW:")
+    print(f"  1. Upload video → returns job_id instantly")
+    print(f"  2. Frontend polls /api/job/{{job_id}} every 3s")
+    print(f"  3. Analysis runs in background thread (no timeout!)")
+    print(f"  4. Falls detected → staged voice alert + Telegram")
     print("=" * 70 + "\n")
 
     uvicorn.run(app, host="0.0.0.0", port=port)
