@@ -1,15 +1,6 @@
-"""
-EquiFall+ Backend — ONNX Runtime (no PyTorch, ~120MB RAM)
-Requires: yolov8n-pose.onnx in the same directory.
-Generate it once on your laptop:
-    pip install ultralytics
-    python -c "from ultralytics import YOLO; YOLO('yolov8n-pose.pt').export(format='onnx', imgsz=640)"
-Then upload yolov8n-pose.onnx to your Render repo.
-"""
-
 from fastapi import FastAPI, UploadFile, File, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import StreamingResponse
+from fastapi.responses import StreamingResponse, FileResponse
 import cv2
 import numpy as np
 import onnxruntime as ort
@@ -458,13 +449,11 @@ def stream_video(video_id: str):
     if not path.exists():
         raise HTTPException(status_code=404, detail="Video not found")
 
-    def iterfile():
-        with open(path, "rb") as f:
-            while chunk := f.read(1024 * 64):
-                yield chunk
-
-    return StreamingResponse(iterfile(), media_type="video/mp4")
-
+    return FileResponse(
+        path=str(path),
+        media_type="video/mp4",
+        filename=f"{video_id}.mp4",
+    )
 
 @app.get("/api/notifications/sent")
 def get_notifications():
