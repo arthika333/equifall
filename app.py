@@ -507,3 +507,4 @@ if __name__ == "__main__":
     print(f"  RAM usage: ~120MB (vs ~500MB with PyTorch)")
     print(f"{'='*50}\n")
     uvicorn.run(app, host="0.0.0.0", port=port)
+#end of file
