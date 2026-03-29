@@ -87,7 +87,6 @@ Alert System (Telegram / SMS / Email)
 
 ## Installation (Local Setup)
 
-git clone https://github.com/arthika333/equifall.git
-cd equifall
-pip install -r requirements.txt
-python app.py
+-- git clone https://github.com/arthika333/equifall.git
+-- cd equifall
+-- pip install -r requirements.txt python app.py
