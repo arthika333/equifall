@@ -1,3 +1,12 @@
+"""
+EquiFall+ Backend — ONNX Runtime (no PyTorch, ~120MB RAM)
+Requires: yolov8n-pose.onnx in the same directory.
+Generate it once on your laptop:
+    pip install ultralytics
+    python -c "from ultralytics import YOLO; YOLO('yolov8n-pose.pt').export(format='onnx', imgsz=640)"
+Then upload yolov8n-pose.onnx to your Render repo.
+"""
+
 from fastapi import FastAPI, UploadFile, File, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse, FileResponse
@@ -17,6 +26,7 @@ import threading
 import time
 import uuid
 import json
+import subprocess
 
 load_dotenv()
 
@@ -299,10 +309,10 @@ def process_video_job(job_id, video_path, facility_id):
         w = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
         h = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
 
-        # Output processed video
-        out_path = PROCESSED_DIR / f"{job_id}.mp4"
+        # Write with mp4v first (universally available in OpenCV)
+        temp_out_path = PROCESSED_DIR / f"{job_id}_temp.mp4"
         fourcc = cv2.VideoWriter_fourcc(*"mp4v")
-        out = cv2.VideoWriter(str(out_path), fourcc, fps, (w, h))
+        out = cv2.VideoWriter(str(temp_out_path), fourcc, fps, (w, h))
 
         fall_events = []
         in_fall = False
@@ -356,15 +366,31 @@ def process_video_job(job_id, video_path, facility_id):
         cap.release()
         out.release()
 
+        # Re-encode to H.264 so browsers can play it
+        final_out_path = PROCESSED_DIR / f"{job_id}.mp4"
+        try:
+            subprocess.run([
+                "ffmpeg", "-y", "-i", str(temp_out_path),
+                "-c:v", "libx264", "-preset", "fast",
+                "-movflags", "+faststart",
+                "-pix_fmt", "yuv420p",
+                str(final_out_path)
+            ], check=True, capture_output=True, timeout=300)
+            temp_out_path.unlink(missing_ok=True)
+            logger.info(f"Re-encoded {job_id} to H.264")
+        except Exception as e:
+            logger.warning(f"ffmpeg re-encode failed, using mp4v fallback: {e}")
+            shutil.move(str(temp_out_path), str(final_out_path))
+
         # Build result
         video_id = job_id
         alert_result = None
         if fall_events and not alert_cancelled:
             msg = (
-                f"🚨 <b>EquiFall+ Alert</b>\n"
-                f"📍 Location: {facility_id or 'Unknown'}\n"
-                f"⚠️ Falls detected: {len(fall_events)}\n"
-                f"🕐 Time: {datetime.now().strftime('%H:%M:%S')}"
+                f"\U0001f6a8 <b>EquiFall+ Alert</b>\n"
+                f"\U0001f4cd Location: {facility_id or 'Unknown'}\n"
+                f"\u26a0\ufe0f Falls detected: {len(fall_events)}\n"
+                f"\U0001f550 Time: {datetime.now().strftime('%H:%M:%S')}"
             )
             tg_ok, _ = send_telegram(msg)
             alert_result = {
@@ -452,8 +478,8 @@ def stream_video(video_id: str):
     return FileResponse(
         path=str(path),
         media_type="video/mp4",
-        filename=f"{video_id}.mp4",
     )
+
 
 @app.get("/api/notifications/sent")
 def get_notifications():
@@ -475,7 +501,7 @@ def get_incidents():
 
 @app.post("/api/telegram/test")
 def test_telegram():
-    ok, error = send_telegram("✅ EquiFall+ test message — Telegram alerts are working!")
+    ok, error = send_telegram("\u2705 EquiFall+ test message \u2014 Telegram alerts are working!")
     return {"success": ok, "error": error}
 
 
@@ -496,4 +522,3 @@ if __name__ == "__main__":
     print(f"  RAM usage: ~120MB (vs ~500MB with PyTorch)")
     print(f"{'='*50}\n")
     uvicorn.run(app, host="0.0.0.0", port=port)
-#end of file
