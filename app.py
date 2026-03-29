@@ -273,10 +273,14 @@ def analyze_video_file(video_path: str, facility_id: str = "Facility A", job_id:
     logger.info(f"🔍 Analyzing video: {total_frames} frames, {fps} FPS")
 
     frame_idx = 0
+    SKIP = 3  # Only analyze every 3rd frame — saves memory on free tier
     while True:
         ret, frame = cap.read()
         if not ret:
             break
+        if frame_idx % SKIP != 0:
+            frame_idx += 1
+            continue
 
         # Update progress in job store
         if job_id and total_frames > 0:
