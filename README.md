@@ -74,15 +74,13 @@ It then:
 
 ## Architecture
 --
-        Camera / Upload
-              ↓
- Fall Detection Model (YOLOv8)
-              ↓
-       FastAPI Backend
-              ↓
-Alert System (Telegram / SMS / Email)
-              ↓
-    Dashboard and Analytics
+```mermaid
+        flowchart TD
+        A[Camera / Upload] --> B[Fall Detection Model using YOLOv8] --> C[FastAPI Backend] --> D[Alert System with Telegram / SMS / Email] --> E[Dashboard and Analytics];
+        
+
+```
+    
 
 
 ## Installation (Local Setup)
