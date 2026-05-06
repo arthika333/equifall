@@ -1,7 +1,10 @@
+<img width="1536" height="1024" alt="8b21cf02-38b5-4b0e-bf33-d52cdb5cf8ff" src="https://github.com/user-attachments/assets/00b48c11-13d9-434c-81ab-37e267a613a1" />
+
 # EquiFall+  
 ### AI-Powered Fall Detection and Emergency Response System
 
 Turning passive cameras into active caregivers.
+<img width="1536" height="1024" alt="equifall" src="https://github.com/user-attachments/assets/d9e66c97-fd53-4f96-a438-fd4895506bcc" />
 
 ---
 
@@ -73,7 +76,7 @@ It then:
 ---
 
 ## Architecture
---
+
 ```mermaid
         flowchart TD
         A[Camera / Upload] --> B[Fall Detection Model using YOLOv8] --> C[FastAPI Backend] --> D[Alert System with Telegram / SMS / Email] --> E[Dashboard and Analytics];
@@ -81,6 +84,27 @@ It then:
 
 ```
     
+## The Lovable Website
+
+### Working:
+
+https://github.com/user-attachments/assets/2023fe13-3dbf-46c8-a6a2-bf1d00cce7b1
+
+
+### Fall detected bounding box:
+<img width="1284" height="640" alt="image" src="https://github.com/user-attachments/assets/9c794622-f2c3-455c-abbc-e3df2c12e2fa" />
+
+### Protocol to assess the situation:
+<img width="1600" height="813" alt="h2" src="https://github.com/user-attachments/assets/5532862d-29eb-4c12-8100-63a46b73cbc2" />
+
+### Which provides this automated notification to emergency contacts:
+<img width="1970" height="730" alt="image" src="https://github.com/user-attachments/assets/721adec8-5a8d-4172-beeb-e82d7441fa17" />
+
+### Incident timeline:
+<img width="1600" height="380" alt="inci" src="https://github.com/user-attachments/assets/e3fc2388-8456-4b60-962b-63d7d51b58c9" />
+
+### The generated report:
+<img width="1600" height="933" alt="report" src="https://github.com/user-attachments/assets/13804e84-b812-4da5-98f3-6f87e49c7101" />
 
 
 ## Installation (Local Setup)
