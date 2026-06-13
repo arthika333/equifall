@@ -1,7 +1,7 @@
-<img width="1536" height="1024" alt="8b21cf02-38b5-4b0e-bf33-d52cdb5cf8ff" src="https://github.com/user-attachments/assets/00b48c11-13d9-434c-81ab-37e267a613a1" />
 
 # EquiFall+  
 ### AI-Powered Fall Detection and Emergency Response System
+- Try Out The [Web App!](https://equifallplus.lovable.app/)
 
 Turning passive cameras into active caregivers.
 <img width="1536" height="1024" alt="equifall" src="https://github.com/user-attachments/assets/d9e66c97-fd53-4f96-a438-fd4895506bcc" />
@@ -112,3 +112,7 @@ https://github.com/user-attachments/assets/2023fe13-3dbf-46c8-a6a2-bf1d00cce7b1
 -- git clone https://github.com/arthika333/equifall.git
 -- cd equifall
 -- pip install -r requirements.txt python app.py
+
+---
+
+<img width="1536" height="1024" alt="8b21cf02-38b5-4b0e-bf33-d52cdb5cf8ff" src="https://github.com/user-attachments/assets/00b48c11-13d9-434c-81ab-37e267a613a1" />
